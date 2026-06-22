@@ -109,7 +109,7 @@ pub fn atr(klines: &[Kline], period: usize) -> Vec<Option<f64>> {
 
 pub fn adx(klines: &[Kline], period: usize) -> Vec<Option<AdxPoint>> {
     let mut out = vec![None; klines.len()];
-    if period == 0 || klines.len() < period * 2 + 1 {
+    if period == 0 || klines.len() < period * 2 {
         return out;
     }
 
@@ -132,6 +132,8 @@ pub fn adx(klines: &[Kline], period: usize) -> Vec<Option<AdxPoint>> {
     let mut minus_smooth = minus_dm[1..=period].iter().sum::<f64>();
 
     let mut dx = vec![None; klines.len()];
+    let mut di = vec![None; klines.len()];
+
     for i in period..klines.len() {
         if i > period {
             tr_smooth = tr_smooth - tr_smooth / period as f64 + tr[i];
@@ -144,29 +146,43 @@ pub fn adx(klines: &[Kline], period: usize) -> Vec<Option<AdxPoint>> {
         }
         let plus_di = 100.0 * plus_smooth / tr_smooth;
         let minus_di = 100.0 * minus_smooth / tr_smooth;
+        di[i] = Some((plus_di, minus_di));
+
         let denom = plus_di + minus_di;
         if denom > f64::EPSILON {
             dx[i] = Some(100.0 * (plus_di - minus_di).abs() / denom);
         }
     }
 
-    let mut adx_prev = dx[period..period * 2]
+    let first_adx_index = period * 2 - 1;
+    let dx_window: Vec<f64> = dx[period..=first_adx_index]
         .iter()
         .filter_map(|v| *v)
-        .sum::<f64>()
-        / period as f64;
+        .collect();
+    if dx_window.len() < period {
+        return out;
+    }
 
-    for i in period * 2..klines.len() {
-        if let Some(current_dx) = dx[i] {
-            adx_prev = (adx_prev * (period as f64 - 1.0) + current_dx) / period as f64;
-        }
-        let plus_di = if tr_smooth > f64::EPSILON { 100.0 * plus_smooth / tr_smooth } else { 0.0 };
-        let minus_di = if tr_smooth > f64::EPSILON { 100.0 * minus_smooth / tr_smooth } else { 0.0 };
-        out[i] = Some(AdxPoint {
-            adx: adx_prev,
+    let mut adx_value = dx_window.iter().sum::<f64>() / period as f64;
+    if let Some((plus_di, minus_di)) = di[first_adx_index] {
+        out[first_adx_index] = Some(AdxPoint {
+            adx: adx_value,
             plus_di,
             minus_di,
         });
+    }
+
+    for i in first_adx_index + 1..klines.len() {
+        if let Some(current_dx) = dx[i] {
+            adx_value = (adx_value * (period as f64 - 1.0) + current_dx) / period as f64;
+        }
+        if let Some((plus_di, minus_di)) = di[i] {
+            out[i] = Some(AdxPoint {
+                adx: adx_value,
+                plus_di,
+                minus_di,
+            });
+        }
     }
 
     out
