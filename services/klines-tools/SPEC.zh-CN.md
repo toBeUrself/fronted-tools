@@ -5,13 +5,13 @@
 | 项目 | 内容 |
 |---|---|
 | 模块名 | `services/klines-tools` |
-| 文档定位 | 需求与系统设计文档，不绑定当前已有代码实现 |
-| 核心能力 | K线数据分析、指标计算、行情状态识别、网格策略辅助、TradingView 展示数据输出 |
-| 版本 | v1.0 production-ready spec |
-| 适用阶段 | 后续重新实施、分析服务设计、前端展示、回测验证、准实盘风控接入 |
-| 不适用范围 | 自动下单、账户管理、保证盈利、替代回测 |
+| 文档定位 | 需求、系统设计、接口契约、风控动作契约、回测验收文档 |
+| 核心能力 | K线数据分析、指标计算、行情状态识别、网格策略辅助、TradingView 展示数据输出、回测与复盘数据契约 |
+| 版本 | v1.1 production-ready execution spec |
+| 适用阶段 | 重新实施、分析服务设计、前端展示、回测验证、影子运行、准实盘风控接入、小资金灰度 |
+| 不适用范围 | 自动下单、账户管理、资金划转、保证盈利、替代回测、替代人工风控 |
 
-> production-ready 指工程需求、接口契约、风控约束、测试、回测、观测和灰度机制达到可生产落地标准；不表示策略一定盈利。所有评分阈值必须通过历史数据、手续费、滑点和流动性回测后才能用于真实交易。
+> 本模块是行情状态识别与网格风控辅助系统，不是投资建议系统，也不保证盈利。所有评分阈值、权重、状态迁移和风控动作必须通过历史数据、手续费、滑点、流动性、交易所规则和样本外验证后，才能进入真实交易链路。
 
 ---
 
@@ -27,6 +27,7 @@
 下跌破位风险是否正在上升？
 普通网格是否应该暂停、移动、减仓或进入等待？
 当前信号能否解释给前端和后续复盘？
+当前风控动作是否能被执行层无歧义消费？
 ```
 
 核心输出：
@@ -37,10 +38,20 @@ up_score：上涨/向上突破评分
 down_score：下跌/向下破位评分
 state：最终行情状态
 grid_plan：网格建议
-risk：风控动作与风险等级
+risk：风险等级与解释
+risk_decision：可执行风控决策
 signals：前端图表可展示信号
 reasons：评分和状态判断原因
 ```
+
+设计原则：
+
+1. 风控阻断优先于收益机会。
+2. 只使用已闭合 K线进行状态确认，未闭合 K线只能用于观察。
+3. 分析层输出建议和动作契约，但不直接下单。
+4. 回测、实时分析和复盘必须使用同一套指标、状态机和配置版本。
+5. 默认参数只是初始经验值，生产参数必须经过回测、样本外验证和灰度。
+6. 宁愿错过部分行情，也不能在极端下跌中灾难性连续补仓。
 
 ---
 
@@ -49,9 +60,11 @@ reasons：评分和状态判断原因
 ```text
 K线 API / CSV / 数据库
         ↓
-数据校验、去重、时间排序、连续性检查
+数据校验、去重、时间排序、连续性检查、闭合状态识别
         ↓
-多周期聚合与指标计算
+多周期聚合与时间对齐
+        ↓
+指标计算、warmup 与可用性检查
         ↓
 特征归一化与历史分位数计算
         ↓
@@ -63,7 +76,7 @@ K线 API / CSV / 数据库
         ↓
 状态机：候选状态 + 确认期 + 冷却期 + 滞后阈值 + 假突破回归
         ↓
-网格计划 / 风控动作 / TradingView 信号
+网格计划 / 可执行风控动作 / TradingView 信号
         ↓
 API 输出 / 入库 / 监控 / 回测 / 灰度验证
 ```
@@ -80,8 +93,6 @@ API 输出 / 入库 / 监控 / 回测 / 灰度验证
 GET /api/v1/public/market/klines
 ```
 
-请求参数：
-
 | 参数 | 是否必填 | 类型 | 说明 |
 |---|---:|---|---|
 | `source` | 否 | string | 数据来源，不传时后端默认一般为 `binance` |
@@ -93,16 +104,22 @@ GET /api/v1/public/market/klines
 
 ### 3.2 CSV 输入
 
-支持标准字段：
+标准字段：
 
 ```csv
 open_time,open,high,low,close,volume
 ```
 
-支持数据库字段别名：
+数据库字段别名：
 
 ```csv
 open_time,open_price,high_price,low_price,close_price,base_volume
+```
+
+可选字段：
+
+```csv
+close_time,quote_volume,trade_count,taker_buy_base_volume,taker_buy_quote_volume,is_closed
 ```
 
 ### 3.3 API 返回结构兼容
@@ -115,6 +132,8 @@ open_time,open_price,high_price,low_price,close_price,base_volume
 [open_time, open, high, low, close, volume]
 ```
 
+如果数组包含更多字段，前 6 个字段必须保持上述含义。额外字段可解析为 `close_time`、`quote_volume` 等辅助信息，但不得改变核心 OHLCV 语义。
+
 ---
 
 ## 4. 数据模型与数据质量
@@ -124,11 +143,14 @@ open_time,open_price,high_price,low_price,close_price,base_volume
 ```rust
 pub struct Kline {
     pub open_time: i64,
+    pub close_time: Option<i64>,
     pub open: f64,
     pub high: f64,
     pub low: f64,
     pub close: f64,
     pub volume: f64,
+    pub quote_volume: Option<f64>,
+    pub trade_count: Option<u64>,
     pub is_closed: bool,
 }
 ```
@@ -144,7 +166,9 @@ high >= close
 low <= open
 low <= close
 volume >= 0
-所有价格和成交量字段均为有限数字
+quote_volume 若存在则 >= 0
+所有价格和成交量字段均为有限数字，不能为 NaN / Inf
+open_time 必须能被 interval 对齐，或记录为质量问题
 ```
 
 必须检查：
@@ -155,25 +179,44 @@ volume >= 0
 是否存在乱序 K线
 是否包含未闭合 K线
 最新 K线延迟是否超过阈值
+K线数量是否满足核心指标 warmup 要求
 ```
 
-策略状态确认只允许使用已闭合 K线。未闭合 K线只能用于实时观察。
+策略状态确认只允许使用已闭合 K线。未闭合 K线只能用于实时观察和前端提示，不得用于 `confirmed` 状态、冷却期推进、候选状态计数或风控强制动作。
 
 ### 4.3 DataQuality
 
 ```rust
 pub struct DataQuality {
     pub input_kline_count: usize,
+    pub usable_closed_kline_count: usize,
     pub missing_kline_count: usize,
     pub duplicate_kline_count: usize,
+    pub out_of_order_count: usize,
+    pub invalid_ohlcv_count: usize,
     pub has_gap: bool,
     pub has_unclosed_kline: bool,
     pub latest_kline_delay_ms: i64,
+    pub warmup_satisfied: bool,
     pub quality_score: f64,
+    pub issues: Vec<String>,
 }
 ```
 
-`quality_score` 范围为 `0.0 ~ 1.0`。若存在严重缺口、延迟或未闭合 K线参与确认，必须降低置信度或进入 `wait` / `risk_control`。
+`quality_score` 范围为 `0.0 ~ 1.0`。若存在严重缺口、延迟、核心指标不可用或未闭合 K线试图参与确认，必须降低置信度或进入 `wait` / `risk_control`。
+
+建议处理：
+
+| 问题 | 处理 |
+|---|---|
+| 非法 OHLCV | 丢弃非法 K线；超过阈值返回错误或进入 `wait` |
+| 重复 open_time | 保留最后一条或按数据源规则合并，并记录 issue |
+| 乱序 K线 | 排序后继续处理，记录 issue |
+| 缺失 K线 | 轻微缺失降低 `quality_score`；严重缺失进入 `wait` |
+| latest 延迟超过 1 个周期 | 降低置信度 |
+| latest 延迟超过 2 个周期 | 禁止新开普通网格 |
+| warmup 不满足 | 不输出 confirmed 状态，只允许 `wait` |
+| 未闭合 K线参与确认 | 禁止，视为实现错误 |
 
 ---
 
@@ -188,6 +231,15 @@ pub struct DataQuality {
 | `5m` / `1m` | 网格触发、信号展示、成交模拟 |
 | `1d` / `1w` | 长期趋势与极端风险背景 |
 
+默认组合：
+
+| 模式 | higher | middle | lower |
+|---|---|---|---|
+| 短线观察 | `1h` | `15m` | `5m` |
+| 常规网格 | `4h` | `30m` | `5m` |
+| 高频展示 | `1h` | `15m` | `1m` |
+| 日内风控 | `1d` | `1h` | `15m` |
+
 ### 5.2 多周期输入结构
 
 ```rust
@@ -196,9 +248,34 @@ pub struct MultiTimeframeInput {
     pub middle: TimeframeAnalysis,
     pub lower: TimeframeAnalysis,
 }
+
+pub struct TimeframeSnapshotRef {
+    pub source: String,
+    pub symbol: String,
+    pub interval: String,
+    pub open_time: i64,
+    pub close_time: i64,
+    pub is_closed: bool,
+    pub state: MarketState,
+    pub raw_scores: Scores,
+    pub smoothed_scores: Scores,
+    pub confidence: f64,
+}
 ```
 
-### 5.3 多周期合并决策矩阵
+### 5.3 多周期时间对齐规则
+
+生产和回测必须使用相同的时间对齐规则：
+
+```text
+所有状态确认只使用各周期最新已闭合 K线。
+lower timeframe 的时间点 T，只能引用 close_time <= T 的 higher / middle timeframe 分析结果。
+不得用尚未闭合的 higher timeframe K线参与 lower timeframe 状态确认。
+如果 higher timeframe 最新已闭合结果延迟超过配置阈值，则降低 confidence 或进入 wait。
+每个 multi-timeframe 输出必须记录实际引用的各周期 snapshot open_time / close_time。
+```
+
+### 5.4 多周期合并决策矩阵
 
 | 大周期状态 | 中周期状态 | 小周期状态 | 最终状态/动作 |
 |---|---|---|---|
@@ -215,7 +292,7 @@ pub struct MultiTimeframeInput {
 优先级：
 
 ```text
-P0：大周期下跌风险 > 中周期下跌风险 > 小周期破位预警
+P0：全局硬止损 > 大周期下跌风险 > 中周期下跌风险 > 小周期破位预警
 P1：风控阻断优先于网格开启
 P2：上涨趋势中只允许趋势跟随网格，不允许固定震荡网格
 P3：只有多周期均无下跌风险且中周期震荡成立，才允许普通网格
@@ -250,14 +327,43 @@ P3：只有多周期均无下跌风险且中周期震荡成立，才允许普通
 
 ## 7. 指标计算规范
 
-### 7.1 MA / EMA
+### 7.1 通用计算边界
 
 ```text
-MA20 用于中期方向
-MA20 / MA60 粘合度用于判断震荡
-MA20 斜率用于判断方向变化
-EMA20 偏离率用于判断价格偏离均值的程度
+所有指标默认只基于已闭合 K线计算。
+指标不足 warmup 时返回 null / unavailable，不得用 0 代替。
+所有 NaN / Inf 必须转换为 unavailable，并写入 data_quality.issues。
+所有百分比类指标统一用小数表示，例如 1% = 0.01。
+所有评分输入必须先经过 finite 检查。
 ```
+
+推荐 warmup：
+
+| 指标 | 最小可用 K线 | 建议 warmup |
+|---|---:|---:|
+| MA20 / EMA20 | 20 | 60 |
+| MA60 | 60 | 120 |
+| BOLL20 | 20 | 60 |
+| MACD 12/26/9 | 35 | 120 |
+| ATR14 | 15 | 100 |
+| ADX/DMI14 | 28 | 150 |
+| RSI14 | 15 | 100 |
+| Volume Ratio20 | 20 | 60 |
+| Donchian20 | 20 | 60 |
+| Percentile1000 | 100 | 1000 |
+
+```rust
+pub struct IndicatorAvailability {
+    pub min_required_bars: usize,
+    pub warmup_bars: usize,
+    pub ready: bool,
+    pub unavailable_fields: Vec<String>,
+}
+```
+
+状态确认必须在 MVP 核心指标 ready 后进行；若非核心增强指标不可用，可降低 confidence，但不得强行退出整个分析。
+
+### 7.2 MA / EMA
 
 ```text
 ma_spread = (max(MA20, MA60) - min(MA20, MA60)) / close
@@ -265,30 +371,29 @@ ma20_slope = (MA20_now - MA20_n_bars_ago) / MA20_n_bars_ago
 ema20_deviation = (close - EMA20) / EMA20
 ```
 
-### 7.2 BOLL 与 %B
+EMA 默认使用首个 EMA period 的 SMA 作为初始值。历史数据不足时返回 unavailable。
+
+### 7.3 BOLL 与 %B
 
 默认：`period = 20`，`multiplier = 2.0`。
 
 ```text
 mid = SMA(close, period)
-std = standard_deviation(close, period)
+std = population_standard_deviation(close, period)
 upper = mid + multiplier * std
 lower = mid - multiplier * std
 bandwidth = (upper - lower) / abs(mid)
 percent_b = (close - lower) / (upper - lower)
 ```
 
-解释：
+特殊情况：
 
 ```text
-percent_b > 0.8：接近 BOLL 上沿，偏强或上沿测试
-percent_b < 0.2：接近 BOLL 下沿，偏弱或下沿测试
-0.3 <= percent_b <= 0.7：区间中部，偏震荡
+如果 upper == lower，则 percent_b unavailable，bandwidth = 0。
+如果 mid == 0，则 bandwidth unavailable。
 ```
 
-BOLL 带宽极低不等于适合网格，可能是变盘前夜；BOLL 上下轨可作为动态区间参考，但不能作为唯一止损依据。
-
-### 7.3 MACD
+### 7.4 MACD
 
 默认：`fast = 12`、`slow = 26`、`signal = 9`。
 
@@ -296,37 +401,35 @@ BOLL 带宽极低不等于适合网格，可能是变盘前夜；BOLL 上下轨�
 dif = EMA(close, fast) - EMA(close, slow)
 dea = EMA(dif, signal)
 hist = dif - dea
+金叉：hist_prev <= 0 && hist_now > 0
+死叉：hist_prev >= 0 && hist_now < 0
 ```
 
-### 7.4 ATR
+### 7.5 ATR
 
 默认：`period = 14`。
 
 ```text
-TR = max(
-  high - low,
-  abs(high - previous_close),
-  abs(low - previous_close)
-)
+TR = max(high - low, abs(high - previous_close), abs(low - previous_close))
+首个 ATR = 前 period 个 TR 的 SMA
+后续 ATR = (previous_ATR * (period - 1) + TR_now) / period
 ```
 
-ATR 使用 Wilder 平滑，用于动态网格间距、波动风险识别、止损缓冲和趋势跟随网格范围。
-
-### 7.5 ADX / DMI
+### 7.6 ADX / DMI
 
 默认：`period = 14`。
-
-经验阈值：
 
 ```text
 ADX < 20：趋势弱
 20 <= ADX < 25：趋势开始增强
 ADX >= 25：趋势较明显
++DI > -DI：多头方向压力更强
+-DI > +DI：空头方向压力更强
 ```
 
 实际阈值必须按 `source + symbol + interval` 回测校准。
 
-### 7.6 RSI
+### 7.7 RSI
 
 默认：`period = 14`。
 
@@ -336,42 +439,35 @@ RSI > 70：短期超买
 RSI < 30：短期超卖
 ```
 
-RSI 不单独决定买卖，只作为位置和风险辅助。
+RSI 使用 Wilder 平滑。RSI 不单独决定买卖，只作为位置和风险辅助。
 
-### 7.7 Volume Ratio
+### 7.8 Volume Ratio
 
 默认：`volume_ma_period = 20`。
 
 ```text
 volume_ratio = current_volume / SMA(volume, 20)
-```
-
-```text
 volume_ratio >= 1.5：放量
 0.7 <= volume_ratio <= 1.3：成交量平稳
 volume_ratio < 0.7：缩量
 ```
 
-### 7.8 Donchian Channel
+如果 `SMA(volume, 20) == 0`，则 `volume_ratio` unavailable。
+
+### 7.9 Donchian Channel
 
 默认：`N = 20`。
 
 ```text
 donchian_high = highest(high, N)
 donchian_low = lowest(low, N)
+close > donchian_high_prev：向上突破候选
+close < donchian_low_prev：向下破位候选
 ```
 
-用途：
+突破判断建议使用上一根之前形成的通道边界，避免当前 K线同时参与边界计算导致永远不突破。
 
-```text
-close > donchian_high：向上突破候选
-close < donchian_low：向下破位候选
-突破后若 2~3 根 K线内回到通道内，视为假突破候选
-```
-
-Donchian 适合补充 BOLL。BOLL 更偏均值和波动，Donchian 更偏真实价格结构边界。
-
-### 7.9 Keltner Channel（v1.1）
+### 7.10 Keltner Channel（v1.1）
 
 ```text
 keltner_mid = EMA(close, 20)
@@ -379,15 +475,7 @@ keltner_upper = keltner_mid + 2 * ATR(20)
 keltner_lower = keltner_mid - 2 * ATR(20)
 ```
 
-用途：
-
-```text
-BOLL 突破 + Keltner 同向突破：突破可信度更高
-BOLL 突破但 Keltner 未突破：假突破风险更高
-BOLL 带宽扩张 + Keltner 扩张：波动扩张确认
-```
-
-### 7.10 Price Structure
+### 7.11 Price Structure
 
 需要识别：
 
@@ -401,6 +489,15 @@ range_low
 swing_high
 swing_low
 ```
+
+推荐 swing 识别规则：
+
+```text
+swing_high：当前 high 高于左右各 pivot_left / pivot_right 根 K线 high
+swing_low：当前 low 低于左右各 pivot_left / pivot_right 根 K线 low
+```
+
+为了避免未来函数，实时模式下只有当右侧 `pivot_right` 根 K线闭合后，才能确认 swing 点。
 
 ---
 
@@ -424,6 +521,8 @@ ma_spread
 ema20_deviation
 recent_range_width
 grid_step / close
+spread / close
+liquidity_depth
 ```
 
 分位数解释：
@@ -435,6 +534,8 @@ grid_step / close
 70% ~ 85%：偏高
 > 85%：极高
 ```
+
+样本数不足时，使用固定阈值兜底并降低 confidence；样本数满足 `percentile_min_samples` 后，优先使用历史分位数。
 
 ---
 
@@ -455,6 +556,8 @@ down_score = 价格方向分 + 动能转弱分 + 趋势增强分 + 破位确认�
 3. 同一类证据不能重复加分。
 4. 默认权重是初始经验值，必须回测校准。
 5. 所有阈值必须配置化。
+6. 每个评分输出必须包含 reasons，便于前端解释和复盘。
+7. 如果关键子维度 unavailable，应降低 confidence，并在 reasons 中说明。
 
 ### 9.2 通用线性函数
 
@@ -470,7 +573,9 @@ linear_up(x, x_low, x_high):
   otherwise   -> 100 * (x - x_low) / (x_high - x_low)
 ```
 
-### 9.3 `range_score` 默认权重与评分函数
+所有输出必须 clamp 到 `0 ~ 100`。
+
+### 9.3 `range_score` 默认权重
 
 | 维度 | 权重 | 评分函数 |
 |---|---:|---|
@@ -498,7 +603,7 @@ range_score < 55
 或 down_score >= 60
 ```
 
-### 9.4 `up_score` 默认权重与评分函数
+### 9.4 `up_score` 默认权重
 
 | 维度 | 权重 | 评分函数 |
 |---|---:|---|
@@ -517,7 +622,7 @@ up_score >= 70：uptrend_follow candidate
 up_score >= 80 且连续 confirm_bars 根闭合 K线：uptrend_follow confirmed
 ```
 
-### 9.5 `down_score` 默认权重与评分函数
+### 9.5 `down_score` 默认权重
 
 | 维度 | 权重 | 评分函数 |
 |---|---:|---|
@@ -536,11 +641,35 @@ down_score >= 70：downtrend_risk candidate
 down_score >= 80 且连续 confirm_bars 根闭合 K线：downtrend_risk confirmed
 ```
 
+### 9.6 评分输出结构
+
+```rust
+pub struct Scores {
+    pub range_score: f64,
+    pub up_score: f64,
+    pub down_score: f64,
+}
+
+pub struct ScoreDetail {
+    pub name: String,
+    pub raw_value: Option<f64>,
+    pub sub_score: Option<f64>,
+    pub weight: f64,
+    pub weighted_score: Option<f64>,
+    pub available: bool,
+    pub reason: String,
+}
+
+pub struct ScoreBreakdown {
+    pub range: Vec<ScoreDetail>,
+    pub up: Vec<ScoreDetail>,
+    pub down: Vec<ScoreDetail>,
+}
+```
+
 ---
 
 ## 10. 评分平滑、评分动能与互斥修正
-
-### 10.1 评分平滑
 
 三评分必须同时保留原始分和平滑分。
 
@@ -554,15 +683,7 @@ smoothed_score = EMA(raw_score, smooth_period)
 smooth_period = 3 或 5
 ```
 
-输出建议：
-
-```text
-raw_scores
-smoothed_scores
-score_momentum
-```
-
-### 10.2 评分动能
+评分动能：
 
 ```text
 range_momentum = range_score_now - range_score_prev
@@ -570,14 +691,7 @@ up_momentum = up_score_now - up_score_prev
 down_momentum = down_score_now - down_score_prev
 ```
 
-示例：
-
-```text
-range_score 仍高，但 range_momentum 连续为负，且 up_momentum 快速上升：进入 up_break_warning candidate
-range_score 仍高，但 range_momentum 连续为负，且 down_momentum 快速上升：进入 down_break_warning candidate
-```
-
-### 10.3 评分互斥修正
+互斥修正：
 
 ```text
 if up_score >= 60 or down_score >= 60:
@@ -589,24 +703,15 @@ if up_score >= 70 and down_score >= 70:
     reason += "多空评分冲突，进入等待"
 ```
 
+状态机默认使用 `smoothed_scores`；前端和复盘同时展示 raw 与 smoothed。互斥修正必须记录在 `reasons` 和 `score_breakdown` 中，不能静默修改。
+
 ---
 
 ## 11. 假突破过滤器
 
-### 11.1 目标
+目标是减少短暂突破、缩量突破、插针突破导致的错误状态切换。
 
-减少以下错误：
-
-```text
-价格短暂突破区间上沿后迅速回落，导致过早关闭网格
-价格短暂跌破区间下沿后迅速拉回，导致过早止损
-缩量突破导致误判趋势启动
-插针突破导致状态异常切换
-```
-
-### 11.2 向上假突破规则
-
-进入 `up_break_warning` 后，若满足以下条件，则回到 `range_grid` 或 `wait`：
+向上假突破规则：进入 `up_break_warning` 后，若满足以下条件，则回到 `range_grid` 或 `wait`：
 
 ```text
 价格在 fake_breakout_window 根 K线内重新回到 BOLL 上轨或 Donchian 上轨下方
@@ -615,17 +720,7 @@ ADX 未继续上升
 up_score 回落到 warning_exit 以下
 ```
 
-默认参数：
-
-```text
-fake_breakout_window = 2~3
-breakout_volume_confirm_threshold = 1.3~1.5
-warning_exit = 45
-```
-
-### 11.3 向下假突破规则
-
-进入 `down_break_warning` 后，若满足以下条件，则不立即进入 `downtrend_risk`：
+向下假突破规则：进入 `down_break_warning` 后，若满足以下条件，则不立即进入 `downtrend_risk`：
 
 ```text
 价格在 fake_breakout_window 根 K线内重新回到 BOLL 下轨或 Donchian 下轨上方
@@ -634,9 +729,7 @@ ADX 未继续上升
 下跌结构未形成 lower_high + lower_low
 ```
 
-### 11.4 真突破确认规则
-
-突破确认至少需要满足两类以上证据：
+真突破确认至少需要满足两类以上证据：
 
 ```text
 价格证据：收盘价有效突破 BOLL / Donchian / range 边界
@@ -645,6 +738,15 @@ ADX 未继续上升
 成交量证据：volume_ratio >= 阈值
 结构证据：higher_high/higher_low 或 lower_high/lower_low 成立
 ```
+
+插针过滤：若仅 high / low 突破，但 close 回到区间内，默认不视为有效突破。
+
+```text
+向上插针：high > upper_boundary && close <= upper_boundary
+向下插针：low < lower_boundary && close >= lower_boundary
+```
+
+插针可产生 `warning` signal，但不得直接触发 confirmed 趋势状态。
 
 ---
 
@@ -665,8 +767,6 @@ pub enum MarketState {
 
 ### 12.2 状态上下文
 
-确认期和冷却期必须依赖状态上下文。
-
 ```rust
 pub struct StateContext {
     pub previous_state: MarketState,
@@ -678,11 +778,7 @@ pub struct StateContext {
     pub last_grid_exit_time: Option<i64>,
     pub last_stop_loss_time: Option<i64>,
 }
-```
 
-状态迁移输出：
-
-```rust
 pub struct StateTransition {
     pub previous_state: MarketState,
     pub candidate_state: Option<MarketState>,
@@ -722,10 +818,40 @@ cooldown_bars_after_stop_loss = 20
 3. 止损后，必须使用更长冷却期。
 4. 进入状态和退出状态使用不同阈值，避免临界抖动。
 5. 假突破回归路径优先于趋势确认。
+6. 候选状态计数只能由已闭合 K线推进。
+
+### 12.5 状态迁移表
+
+| From | Candidate / To | 条件 | 确认 | 冷却 | 默认动作 |
+|---|---|---|---|---|---|
+| `wait` | `range_grid` | `range_score >= range_enter` 且 `up/down < warning_enter` 且数据质量合格 | `confirm_bars` | 无 | 允许普通网格 |
+| `range_grid` | `up_break_warning` | `up_score >= warning_enter` 或上沿突破候选 | 1 bar | 无 | 不新增普通固定网格，减少卖出密度 |
+| `range_grid` | `down_break_warning` | `down_score >= warning_enter` 或下沿破位候选 | 1 bar | 无 | 暂停新增买单，取消下方补仓单 |
+| `up_break_warning` | `uptrend_follow` | `up_score >= trend_confirm` 且真突破证据 >= 2 类 | `confirm_bars` | `cooldown_bars_after_exit` | 切换上涨跟随模式 |
+| `down_break_warning` | `downtrend_risk` | `down_score >= trend_confirm` 且真破位证据 >= 2 类 | `confirm_bars` | `cooldown_bars_after_exit` 或止损冷却 | hard block |
+| `up_break_warning` | `range_grid` | fake breakout confirmed 且 range 条件仍成立 | 1 bar | 可选 1~2 bars | 恢复普通网格或等待 |
+| `down_break_warning` | `range_grid` | fake breakdown confirmed 且 range 条件仍成立 | 1 bar | 可选 1~2 bars | 谨慎恢复，默认小资金 |
+| `uptrend_follow` | `wait` | up_score 低于 exit 且 range 不成立 | `confirm_bars` | `cooldown_bars_after_exit` | 停止趋势跟随新增 |
+| `downtrend_risk` | `wait` | down_score 低于 exit 且无新低结构 | `confirm_bars` | `cooldown_bars_after_stop_loss` | 解除 hard block 但不立即开网格 |
+| 任意 | `wait` | 数据质量不足或指标 unavailable | 1 bar | 无 | 不开新网格 |
+| 任意 | `risk_control` | 全局硬止损触发 | 立即 | `cooldown_bars_after_stop_loss` | emergency stop |
+
+优先级：
+
+```text
+1. 全局硬止损 / emergency_stop
+2. 数据质量严重不足
+3. confirmed downtrend_risk
+4. confirmed down_break_warning
+5. confirmed uptrend_follow
+6. warning 状态
+7. range_grid
+8. wait
+```
 
 ---
 
-## 13. 风控等级与动作
+## 13. 风控等级与可执行动作
 
 ### 13.1 RiskLevel
 
@@ -745,7 +871,50 @@ pub enum RiskLevel {
 | `hard_block` | 硬阻断 | 取消未成交单，降低仓位 |
 | `emergency_stop` | 紧急停止 | 停止策略，人工或高优先级流程介入 |
 
-### 13.2 全局硬止损
+### 13.2 可执行 RiskDecision
+
+分析层必须输出足够明确的动作字段，避免执行层自行解释自然语言。
+
+```rust
+pub enum PositionAction {
+    Hold,
+    ReduceOnly,
+    ReduceByRatio,
+    StopLoss,
+    ManualReview,
+}
+
+pub struct RiskDecision {
+    pub risk_level: RiskLevel,
+    pub allow_new_grid: bool,
+    pub allow_new_buy_orders: bool,
+    pub allow_new_sell_orders: bool,
+    pub allow_replace_grid: bool,
+    pub cancel_open_buy_orders: bool,
+    pub cancel_open_sell_orders: bool,
+    pub cancel_buy_orders_below_price: Option<f64>,
+    pub cancel_sell_orders_above_price: Option<f64>,
+    pub position_action: PositionAction,
+    pub reduce_position_ratio: Option<f64>,
+    pub require_manual_confirm: bool,
+    pub action_ttl_bars: usize,
+    pub reasons: Vec<String>,
+}
+```
+
+默认映射：
+
+| 状态 | risk_level | allow_new_grid | allow_new_buy_orders | allow_new_sell_orders | position_action |
+|---|---|---:|---:|---:|---|
+| `wait` | `advisory` | false | false | false | `Hold` |
+| `range_grid` | `advisory` | true | true | true | `Hold` |
+| `up_break_warning` | `advisory` / `soft_block` | false | false | true | `Hold` |
+| `uptrend_follow` | `advisory` | true，仅趋势跟随 | true | true | `Hold` |
+| `down_break_warning` | `soft_block` | false | false | true | `ReduceOnly` |
+| `downtrend_risk` | `hard_block` | false | false | false | `ReduceByRatio` 或 `StopLoss` |
+| 全局硬止损 | `emergency_stop` | false | false | false | `StopLoss` / `ManualReview` |
+
+### 13.3 全局硬止损
 
 无论状态机结果如何，必须配置全局硬止损：
 
@@ -754,6 +923,7 @@ max_loss_per_symbol
 max_daily_loss
 max_drawdown
 max_position_ratio
+max_grid_capital
 ```
 
 若触发：
@@ -792,6 +962,7 @@ pub struct GridPlan {
     pub center: Option<f64>,
     pub grid_count: usize,
     pub grid_step: Option<f64>,
+    pub price_levels: Vec<f64>,
     pub risk_level: RiskLevel,
     pub risk_action: String,
     pub confidence: f64,
@@ -804,12 +975,15 @@ pub struct GridPlan {
 
 ```text
 数据质量合格
+核心指标 ready
 波动率未失控
 流动性满足要求
 单格利润覆盖手续费、滑点和最小利润缓冲
 大周期无 downtrend_risk
 中周期 range_grid 成立
 状态不在冷却期
+未触发全局硬止损
+交易所规则允许下单
 ```
 
 ### 14.3 边界模式
@@ -853,6 +1027,34 @@ grid_step / center > 2 * fee_rate + expected_slippage_rate + min_profit_buffer
 等待 confirmed 后再执行 hard_block 或止损
 ```
 
+### 14.5 交易所约束
+
+实盘或准实盘输出必须考虑交易所规则，否则 GridPlan 只能用于展示，不能用于执行。
+
+```rust
+pub struct ExchangeConstraints {
+    pub tick_size: f64,
+    pub step_size: f64,
+    pub min_qty: f64,
+    pub min_notional: f64,
+    pub price_precision: u32,
+    pub quantity_precision: u32,
+    pub max_open_orders: Option<usize>,
+    pub maker_fee_rate: f64,
+    pub taker_fee_rate: f64,
+}
+```
+
+规则：
+
+```text
+所有 price levels 必须按 tick_size round。
+所有 quantity 必须按 step_size round。
+round 后若低于 min_notional，则该网格层不可执行。
+如果 grid_count 超过 max_open_orders，必须降低 grid_count 或返回 disabled。
+成本判断优先使用 maker_fee_rate；若策略可能市价退出，止损成本必须使用 taker_fee_rate。
+```
+
 ---
 
 ## 15. 信号输出设计
@@ -879,6 +1081,14 @@ pub struct Signal {
 }
 ```
 
+信号规则：
+
+```text
+signal 是展示和复盘标记，不等于订单。
+每个 signal 必须绑定产生它的 state、score 和 reason。
+同一根 K线上重复信号应合并或去重。
+```
+
 ---
 
 ## 16. 输出 Schema 与 JSON 契约
@@ -894,13 +1104,19 @@ config_version
 source
 symbol
 interval
+time
 generated_at
 is_closed_kline
 data_quality
+indicator_availability
 raw_scores
 smoothed_scores
 score_momentum
+score_breakdown
 state_transition
+grid_plan
+risk_decision
+signals
 ```
 
 ### 16.2 confidence 定义
@@ -909,14 +1125,15 @@ state_transition
 base_confidence = 主状态评分 / 100
 multi_tf_factor = 多周期一致性系数，范围 0.5 ~ 1.2
 data_quality_factor = data_quality.quality_score
-confidence = clamp(base_confidence * multi_tf_factor * data_quality_factor, 0.0, 1.0)
+indicator_factor = 核心指标可用性系数，范围 0.5 ~ 1.0
+confidence = clamp(base_confidence * multi_tf_factor * data_quality_factor * indicator_factor, 0.0, 1.0)
 ```
 
 ### 16.3 JSON 示例
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "model_version": "rule-v1",
   "config_version": "grid-analysis-v1",
   "source": "binance",
@@ -926,39 +1143,23 @@ confidence = clamp(base_confidence * multi_tf_factor * data_quality_factor, 0.0,
   "generated_at": 1710000060000,
   "is_closed_kline": true,
   "state": "range_grid",
-  "raw_scores": {
-    "range_score": 74,
-    "up_score": 20,
-    "down_score": 12
-  },
-  "smoothed_scores": {
-    "range_score": 72,
-    "up_score": 18,
-    "down_score": 10
-  },
-  "score_momentum": {
-    "range_momentum": 2,
-    "up_momentum": -1,
-    "down_momentum": 0
-  },
+  "raw_scores": { "range_score": 74, "up_score": 20, "down_score": 12 },
+  "smoothed_scores": { "range_score": 72, "up_score": 18, "down_score": 10 },
+  "score_momentum": { "range_momentum": 2, "up_momentum": -1, "down_momentum": 0 },
   "confidence": 0.72,
   "data_quality": {
     "input_kline_count": 1000,
+    "usable_closed_kline_count": 1000,
     "missing_kline_count": 0,
     "duplicate_kline_count": 0,
+    "out_of_order_count": 0,
+    "invalid_ohlcv_count": 0,
     "has_gap": false,
     "has_unclosed_kline": false,
     "latest_kline_delay_ms": 0,
-    "quality_score": 1.0
-  },
-  "latest": {
-    "close": 68050.0,
-    "percent_b": 0.62,
-    "ema20_deviation": 0.003,
-    "donchian": {
-      "high": 68650.0,
-      "low": 67250.0
-    }
+    "warmup_satisfied": true,
+    "quality_score": 1.0,
+    "issues": []
   },
   "grid_plan": {
     "enabled": true,
@@ -969,21 +1170,26 @@ confidence = clamp(base_confidence * multi_tf_factor * data_quality_factor, 0.0,
     "center": 67980.0,
     "grid_count": 20,
     "grid_step": 62.0,
+    "price_levels": [],
     "risk_level": "advisory",
     "risk_action": "normal",
     "confidence": 0.72
   },
-  "risk": {
+  "risk_decision": {
     "risk_level": "advisory",
     "allow_new_grid": true,
     "allow_new_buy_orders": true,
     "allow_new_sell_orders": true,
-    "position_action": "hold_or_normal_grid",
-    "reasons": [
-      "ADX 较低，趋势强度偏弱",
-      "BOLL 带宽处于正常分位",
-      "成交量平稳"
-    ]
+    "allow_replace_grid": true,
+    "cancel_open_buy_orders": false,
+    "cancel_open_sell_orders": false,
+    "cancel_buy_orders_below_price": null,
+    "cancel_sell_orders_above_price": null,
+    "position_action": "hold",
+    "reduce_position_ratio": null,
+    "require_manual_confirm": false,
+    "action_ttl_bars": 1,
+    "reasons": ["ADX 较低，趋势强度偏弱", "BOLL 带宽处于正常分位", "成交量平稳"]
   },
   "signals": []
 }
@@ -1003,6 +1209,27 @@ GET /api/v1/analysis/marks
 
 `/api/v1/analysis/marks` 用于 TradingView `getMarks` / `getTimescaleMarks`。
 
+建议参数：
+
+| 参数 | 是否必填 | 说明 |
+|---|---:|---|
+| `source` | 否 | 数据源 |
+| `symbol` | 是 | 交易对 |
+| `interval` | 是 | 分析周期 |
+| `time` | 否 | 指定 K线时间，不传则使用最新已闭合 K线 |
+| `config_version` | 否 | 指定配置版本 |
+| `mode` | 否 | `single` / `multi_timeframe` |
+
+错误码建议：
+
+| code | 含义 |
+|---|---|
+| `INSUFFICIENT_KLINES` | K线不足，指标 warmup 不满足 |
+| `DATA_QUALITY_LOW` | 数据质量过低 |
+| `INDICATOR_UNAVAILABLE` | 核心指标不可用 |
+| `CONFIG_NOT_FOUND` | 配置版本不存在 |
+| `EXCHANGE_CONSTRAINT_FAILED` | 交易所约束不满足 |
+
 ---
 
 ## 18. 数据库设计建议
@@ -1014,6 +1241,7 @@ source
 symbol
 interval
 open_time
+close_time
 schema_version
 model_version
 config_version
@@ -1021,8 +1249,10 @@ state
 raw_scores jsonb
 smoothed_scores jsonb
 score_momentum jsonb
+score_breakdown jsonb
 confidence
 data_quality jsonb
+indicator_availability jsonb
 reasons jsonb
 created_at
 ```
@@ -1083,12 +1313,46 @@ upper
 center
 grid_count
 grid_step
+price_levels jsonb
 risk_level
 risk_action
+risk_decision jsonb
 confidence
 model_version
 config_version
 created_at
+```
+
+### 18.5 analysis_backtest_runs
+
+```text
+run_id
+source
+symbols jsonb
+intervals jsonb
+start_time
+end_time
+model_version
+config_version
+cost_model jsonb
+exchange_constraints jsonb
+metrics jsonb
+created_at
+```
+
+### 18.6 analysis_config_versions
+
+```text
+config_version
+config jsonb
+created_by
+created_at
+notes
+parent_config_version
+backtest_run_id
+approved_for_shadow
+approved_for_gray
+approved_for_production
 ```
 
 ---
@@ -1111,7 +1375,11 @@ created_at
     "volume_ma_period": 20,
     "donchian_period": 20,
     "score_smooth_period": 3,
-    "percentile_window": 1000
+    "percentile_window": 1000,
+    "percentile_min_samples": 100,
+    "pivot_left": 2,
+    "pivot_right": 2,
+    "structure_lookback": 20
   },
   "state": {
     "range_enter": 65,
@@ -1133,6 +1401,7 @@ created_at
     "fee_rate": 0.001,
     "expected_slippage_rate": 0.0005,
     "max_grid_width_by_percent": 0.08,
+    "max_grid_width_by_atr": 6.0,
     "max_capital_usage_at_lower_bound": 0.5
   },
   "risk": {
@@ -1140,14 +1409,64 @@ created_at
     "max_grid_capital": 1000,
     "max_loss_per_symbol": 0.03,
     "max_daily_loss": 0.05,
-    "max_drawdown": 0.1
+    "max_drawdown": 0.1,
+    "default_reduce_position_ratio": 0.3
+  },
+  "data_quality": {
+    "max_latest_delay_intervals": 2,
+    "max_missing_kline_ratio": 0.01,
+    "min_quality_score_for_grid": 0.9
   }
 }
 ```
 
 ---
 
-## 20. 前端 TradingView 集成
+## 20. 参数校准与防过拟合
+
+参数校准必须至少包含：
+
+```text
+训练集：用于搜索参数
+验证集：用于选择参数
+样本外测试集：最终确认，不允许反复调参
+walk-forward：按时间滚动训练/验证
+```
+
+禁止只基于单个交易对、单个周期、单段行情优化参数。
+
+优化目标优先级：
+
+```text
+1. 降低最大回撤
+2. 降低灾难性连续补仓
+3. 控制状态切换频率
+4. 降低误杀和漏判
+5. 在上述约束下提升收益回撤比
+```
+
+每次调整权重或阈值必须：
+
+```text
+记录 config_version
+跑固定回归回测集
+生成与上一版本的指标对比
+人工确认是否进入 shadow / gray / production
+保留可回滚版本
+```
+
+防过拟合要求：
+
+```text
+参数数量越多，越需要更大的样本外数据集。
+不得为了单一历史暴跌或单一山寨币插针过度调参。
+如果新参数提升收益但显著增加最大回撤，不得进入 production。
+如果新参数降低收益但显著降低回撤，可进入只读分析或小资金灰度。
+```
+
+---
+
+## 21. 前端 TradingView 集成
 
 第一阶段：
 
@@ -1166,11 +1485,20 @@ services/klines-tools 输出 state/scores/risk 显示右侧状态面板
 增加 WebSocket 推送闭合 K线后的分析结果
 ```
 
+前端展示要求：
+
+```text
+必须展示当前 state、risk_level、confidence。
+必须展示主要 reasons，不能只展示分数。
+warning / hard_block / emergency_stop 必须有明显视觉区分。
+未闭合 K线产生的观察信号必须标记为 realtime / unconfirmed。
+```
+
 ---
 
-## 21. 回测要求与上线验收标准
+## 22. 回测要求与上线验收标准
 
-### 21.1 回测数据要求
+### 22.1 回测数据要求
 
 ```text
 多个交易对：BTC、ETH、主流山寨
@@ -1179,7 +1507,7 @@ services/klines-tools 输出 state/scores/risk 显示右侧状态面板
 至少 6~12 个月历史数据
 ```
 
-### 21.2 成本模型
+### 22.2 成本模型
 
 ```text
 手续费
@@ -1188,9 +1516,30 @@ services/klines-tools 输出 state/scores/risk 显示右侧状态面板
 最小下单金额
 成交延迟
 部分成交
+资金费率，若用于合约
 ```
 
-### 21.3 对照组
+### 22.3 K线级成交模拟规则
+
+网格回测若只使用 OHLCV，必须显式规定成交假设：
+
+```text
+限价买单：当 low <= buy_price 时视为可成交。
+限价卖单：当 high >= sell_price 时视为可成交。
+同一根 K线同时触发多个网格价位时，默认使用对策略不利的成交顺序。
+若同一根 K线同时触发止损和止盈，默认先触发对策略不利的路径。
+成交价必须考虑滑点、手续费和 tick_size rounding。
+未考虑盘口队列位置时，回测结果必须标记为 optimistic 或 conservative。
+```
+
+建议提供两种模式：
+
+| 模式 | 说明 |
+|---|---|
+| conservative | 同 K线内按最不利路径成交，用于上线验收 |
+| optimistic | 同 K线内按较有利路径成交，仅用于上限参考 |
+
+### 22.4 对照组
 
 ```text
 A. 固定网格，不加指标过滤
@@ -1200,7 +1549,7 @@ D. 生产版维度评分 + 多周期 + 状态机网格
 E. 生产版 + Donchian/%B/评分平滑/假突破过滤器
 ```
 
-### 21.4 核心评价指标
+### 22.5 核心评价指标
 
 ```text
 总收益
@@ -1218,9 +1567,10 @@ E. 生产版 + Donchian/%B/评分平滑/假突破过滤器
 误杀次数：退出后立刻反弹
 漏判次数：未退出后继续大跌
 假突破过滤命中率
+灾难性连续补仓次数
 ```
 
-### 21.5 上线验收标准
+### 22.6 上线验收标准
 
 生产接入前必须至少满足：
 
@@ -1239,9 +1589,9 @@ BTC、ETH、至少 3 个主流币样本表现稳定
 
 ---
 
-## 22. 测试要求
+## 23. 测试要求
 
-### 22.1 单元测试
+### 23.1 单元测试
 
 ```text
 CSV 标准字段解析
@@ -1250,7 +1600,9 @@ API data 包裹解析
 API 数组式 K线解析
 时间字符串解析
 非法 OHLC 报错
+NaN / Inf 拒绝或 unavailable
 K线连续性检查
+未闭合 K线不能参与状态确认
 BOLL 计算
 MACD 计算
 ATR 计算
@@ -1260,14 +1612,17 @@ Volume Ratio 计算
 Donchian Channel 计算
 %B 计算
 EMA20 偏离率计算
+Price Structure 识别
 分位数计算
 评分函数
 评分平滑
 评分动能
+评分互斥修正
 假突破过滤器
+交易所 tick_size / step_size rounding
 ```
 
-### 22.2 集成测试
+### 23.2 集成测试
 
 ```text
 调用 K线 API 成功
@@ -1275,17 +1630,32 @@ API 返回空数据
 API 返回非法数据
 状态机确认期
 状态机冷却期
+多周期时间对齐
 多周期合并判断
 输出 JSON contract 稳定性
+risk_decision 动作字段稳定性
 ```
 
-### 22.3 回归测试
+### 23.3 回归测试
 
 每次调整权重或阈值必须跑固定回测集，输出指标对比。
 
+### 23.4 Golden Tests
+
+建议维护一组固定输入与固定输出的 golden cases：
+
+```text
+标准震荡行情 -> range_grid
+放量上破 -> up_break_warning / uptrend_follow
+放量下破 -> down_break_warning / downtrend_risk
+缩量假突破 -> 回归 range_grid 或 wait
+数据缺失 -> wait + data_quality issue
+未闭合 K线 -> realtime only，不推进状态机
+```
+
 ---
 
-## 23. 可观测性与告警
+## 24. 可观测性与告警
 
 关键日志：
 
@@ -1304,6 +1674,7 @@ score_momentum
 grid_plan
 risk_level
 risk_action
+risk_decision
 reasons
 input_kline_count
 missing_kline_count
@@ -1321,6 +1692,8 @@ downtrend_risk 触发次数
 网格暂停次数
 异常波动触发次数
 假突破过滤次数
+risk_decision hard_block 次数
+emergency_stop 次数
 ```
 
 告警条件：
@@ -1333,74 +1706,8 @@ K线连续性缺失
 多个交易对同时 downtrend_risk
 API 错误率超过阈值
 触发 emergency_stop
+risk_decision 与执行层回执不一致
 ```
-
----
-
-## 24. 备选方案与扩展路线
-
-### 24.1 机器学习分类器
-
-可选方向：
-
-```text
-LightGBM / XGBoost：基于特征窗口分类震荡、上涨、下跌
-LSTM / Transformer：直接学习序列状态，复杂度更高
-```
-
-上线前提：
-
-```text
-必须有清晰标签定义
-必须样本外验证
-必须防止过拟合
-必须保留规则模型作为风控兜底
-```
-
-### 24.2 波动率择时模型
-
-更轻量的备选方案：
-
-```text
-不强行判断方向
-只判断波动率是否适合网格
-波动率正常：允许网格
-波动率急剧扩张：暂停网格
-波动率极低：等待变盘确认
-```
-
-可作为 MVP 或回测对照组。
-
-### 24.3 趋势 / 周期分解
-
-可选方法：
-
-```text
-Kalman Filter
-Hodrick-Prescott Filter
-EMA trend + residual oscillation
-```
-
-目标：
-
-```text
-趋势项判断方向
-周期项判断震荡稳定性
-残差波动判断是否适合网格
-```
-
-### 24.4 盘口微观结构
-
-若后续可获取 Level2 数据，可增加：
-
-```text
-order_book_imbalance
-spread
-depth
-large_order_flow
-```
-
-用于短周期提前预警，但不作为第一版依赖。
 
 ---
 
@@ -1441,9 +1748,84 @@ large_order_flow
 每次参数变更需要回归测试
 ```
 
+### 25.5 回滚要求
+
+```text
+任意 config_version 必须可回滚。
+model_version 变更必须保留旧版本读取和回测能力。
+生产中若 hard_block / emergency_stop 异常增多，应自动降级到只读分析或上一稳定配置。
+```
+
 ---
 
-## 26. 版本演进计划
+## 26. 备选方案与扩展路线
+
+### 26.1 机器学习分类器
+
+可选方向：
+
+```text
+LightGBM / XGBoost：基于特征窗口分类震荡、上涨、下跌
+LSTM / Transformer：直接学习序列状态，复杂度更高
+```
+
+上线前提：
+
+```text
+必须有清晰标签定义
+必须样本外验证
+必须防止过拟合
+必须保留规则模型作为风控兜底
+```
+
+### 26.2 波动率择时模型
+
+更轻量的备选方案：
+
+```text
+不强行判断方向
+只判断波动率是否适合网格
+波动率正常：允许网格
+波动率急剧扩张：暂停网格
+波动率极低：等待变盘确认
+```
+
+可作为 MVP 或回测对照组。
+
+### 26.3 趋势 / 周期分解
+
+可选方法：
+
+```text
+Kalman Filter
+Hodrick-Prescott Filter
+EMA trend + residual oscillation
+```
+
+目标：
+
+```text
+趋势项判断方向
+周期项判断震荡稳定性
+残差波动判断是否适合网格
+```
+
+### 26.4 盘口微观结构
+
+若后续可获取 Level2 数据，可增加：
+
+```text
+order_book_imbalance
+spread
+depth
+large_order_flow
+```
+
+用于短周期提前预警，但不作为第一版依赖。
+
+---
+
+## 27. 版本演进计划
 
 ### MVP
 
@@ -1476,11 +1858,14 @@ EMA20 偏离率
 ### v1.1
 
 ```text
-Keltner Channel
-OBV / VWAP 偏离
-TradingView marks
-历史信号入库
-WebSocket 推送
+指标 warmup 与可用性契约
+多周期时间对齐规则
+可执行 risk_decision
+交易所约束与 rounding
+K线级成交模拟规则
+参数校准与防过拟合流程
+Golden tests
+回滚要求
 ```
 
 ### v2
@@ -1495,11 +1880,12 @@ WebSocket 推送
 
 ---
 
-## 27. 关键结论
+## 28. 关键结论
 
 1. 本模块是行情状态识别与网格风控辅助系统，不是盈利保证系统。
 2. 指标之间有重叠，必须按维度评分，避免重复计分。
 3. 评分没有通用标准，默认权重只是初始经验值，必须用历史数据回测校准。
 4. 高性价比增强项是 Donchian、`%B`、EMA20 偏离率、评分平滑、评分动能、假突破过滤器和全局硬止损。
 5. production-ready 必须包含多周期、成交量、价格结构、成本约束、状态上下文、确认期、冷却期、风险等级、数据质量、假突破过滤和回测验收。
-6. 网格策略的重点不是预测最低点，而是识别什么时候不能继续普通网格。
+6. 真正可执行的 production-ready 还必须包含指标 warmup、时间对齐、状态迁移表、`risk_decision`、交易所约束、成交模拟、参数校准、Golden tests 和回滚机制。
+7. 网格策略的重点不是预测最低点，而是识别什么时候不能继续普通网格。
