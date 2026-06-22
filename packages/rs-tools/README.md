@@ -1,6 +1,6 @@
 # rs-tools
 
-Rust tools for kline analysis. The first binary, `kline-analyze`, reads OHLCV CSV data and outputs a JSON report containing:
+Rust tools for kline analysis. The first binary, `kline-analyze`, reads OHLCV data from CSV or from the market kline API and outputs a JSON report containing:
 
 - BOLL, MACD, ATR, ADX latest values
 - market state scores: range, uptrend, downtrend
@@ -9,7 +9,71 @@ Rust tools for kline analysis. The first binary, `kline-analyze`, reads OHLCV CS
 
 This is an analysis helper, not an auto-trading engine.
 
-## CSV format
+## API input
+
+The CLI can fetch klines from:
+
+```text
+/api/v1/public/market/klines
+```
+
+Supported query params match the backend API:
+
+```rust
+source?: string       // default is backend default, usually binance
+symbol: string        // e.g. BTCUSDT
+interval: string      // e.g. 1m, 5m, 30m
+startTime?: i64       // milliseconds timestamp
+endTime?: i64         // milliseconds timestamp
+limit?: i64           // backend default usually 500, max usually 1000
+```
+
+Run with API:
+
+```bash
+cd packages/rs-tools
+
+cargo run --bin kline-analyze -- \
+  --api-base-url http://127.0.0.1:3000 \
+  --source binance \
+  --symbol BTCUSDT \
+  --interval 5m \
+  --api-limit 1000
+```
+
+With time range:
+
+```bash
+cargo run --bin kline-analyze -- \
+  --api-base-url http://127.0.0.1:3000 \
+  --symbol BTCUSDT \
+  --interval 5m \
+  --start-time 1710000000000 \
+  --end-time 1710086400000 \
+  --api-limit 1000
+```
+
+The parser supports these API response shapes:
+
+```json
+[
+  {"open_time":1710000000000,"open_price":"68000","high_price":"68100","low_price":"67900","close_price":"68050","base_volume":"123.4"}
+]
+```
+
+```json
+{"data":[{"open_time":1710000000000,"open":"68000","high":"68100","low":"67900","close":"68050","volume":"123.4"}]}
+```
+
+It also supports array-style rows such as:
+
+```json
+{"data":[[1710000000000,"68000","68100","67900","68050","123.4"]]}
+```
+
+`open_time` accepts millisecond timestamps, second timestamps, numeric strings, or RFC3339 datetime strings. The analyzer preserves numeric timestamp units in the output. RFC3339 strings are converted to milliseconds.
+
+## CSV input
 
 The CLI accepts headers like:
 
@@ -25,9 +89,7 @@ open_time,open_price,high_price,low_price,close_price,base_volume
 1710000000,68000,68100,67900,68050,123.4
 ```
 
-`open_time` can be seconds or milliseconds. The analyzer only preserves and returns the same timestamp unit; it does not convert units internally.
-
-## Run
+Run with CSV:
 
 ```bash
 cd packages/rs-tools
@@ -40,7 +102,7 @@ Read CSV from stdin:
 cat ./sample.csv | cargo run --bin kline-analyze -- --symbol BTCUSDT --interval 5m
 ```
 
-Limit to recent rows:
+Limit to recent rows after loading data:
 
 ```bash
 cargo run --bin kline-analyze -- --input ./sample.csv --limit 500 --grid-count 20
@@ -88,7 +150,7 @@ cargo run --bin kline-analyze -- --input ./sample.csv --limit 500 --grid-count 2
 ## Suggested usage in the project
 
 1. Keep the kline API as the data source.
-2. Convert the returned kline JSON to the `Kline` struct or to CSV for this CLI.
+2. Run this analyzer from a backend analysis job, or move `analyze_klines` into your Rust service directly.
 3. Use the JSON report to draw markers and grid lines on TradingView:
    - `signals`: chart markers
    - `grid_plan.lower` / `grid_plan.upper` / `grid_plan.center`: horizontal lines
